@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>动态粒子爱心 - To 欣 & Love You</title>
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            background-color: #000; /* 纯黑背景 */
+            overflow: hidden; /* 隐藏滚动条 */
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        canvas {
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="heartCanvas"></canvas>
+
+    <script>
+        const canvas = document.getElementById('heartCanvas');
+        const ctx = canvas.getContext('2d');
+
+        let width, height;
+        let particles = [];
+        let textPointsTop = [];    // 存储 "to 欣" 的像素坐标
+        let textPointsBottom = []; // 存储 "love you" 的像素坐标
+
+        // 粒子类型定义
+        const TYPE_OUTLINE = 0;   // 轮廓粒子
+        const TYPE_INNER = 1;     // 内部散落粒子
+        const TYPE_ORBIT_TEXT = 2; // 外部环绕 & 组字粒子
+
+        // 组字状态机状态定义
+        const STATE_ORBIT = 0;      // 自由环绕状态
+        const STATE_TRANSITION = 1; // 汇聚到文字中
+        const STATE_HOLD = 2;       // 文字成型保持并闪烁
+        const STATE_DISPERSE = 3;   // 散落消失状态
+
+        // 优化后的紧凑生命周期（以 60FPS 计算，总循环约 7 秒，画面更加动感）
+        const DUR_ORBIT = 150;       // 环绕 2.5 秒
+        const DUR_TRANSITION = 60;   // 汇聚过程 1.0 秒 (更利落)
+        const DUR_HOLD = 120;        // 保持并闪烁 2.0 秒
+        const DUR_DISPERSE = 90;     // 散落 1.5 秒
+        const TOTAL_CYCLE = DUR_ORBIT + DUR_TRANSITION + DUR_HOLD + DUR_DISPERSE;
+
+        let frameCount = 0;
+
+        // 初始化画布大小
+        function initCanvas() {
+            width = window.innerWidth;
+            height = window.innerHeight;
+            canvas.width = width;
+            canvas.height = height;
+        }
+
+        // 爱心参数方程 (获取心形轮廓上的点)
+        function getHeartPoint(t) {
+            const x = 16 * Math.pow(Math.sin(t), 3);
+            const y = -(13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t));
+            return { x, y };
+        }
+
+        // 计算爱心在指定 x 坐标下的 Y 轴上下边界 (用于内部粒子均匀采样)
+        function getHeartYBounds(x) {
+            const clampedX = Math.max(-16, Math.min(16, x));
+            const u = Math.sign(clampedX) * Math.pow(Math.abs(clampedX) / 16, 1 / 3);
+            const c = Math.sqrt(Math.max(0, 1 - u * u));
+
+            const cos2t = 1 - 2 * u * u;
+            const cos4t = 8 * Math.pow(c, 4) - 8 * c * c + 1;
+
+            const cos3t_plus = c * (4 * c * c - 3);
+            const y1 = -(13 * c - 5 * cos2t - 2 * cos3t_plus - cos4t);
+
+            const cos3t_minus = -c * (4 * c * c - 3);
+            const y2 = -(-13 * c - 5 * cos2t - 2 * cos3t_minus - cos4t);
+
+            return {
+                minY: Math.min(y1, y2),
+                maxY: Math.max(y1, y2)
+            };
+        }
+
+        // 蒙特卡洛拒绝采样：在爱心内部生成绝对均匀分布的随机坐标，不产生任何中心分割线
+        function getRandomPointInsideHeart() {
+            let attempts = 0;
+            while (attempts < 100) {
+                const x = Math.random() * 32 - 16;  // x 范围 [-16, 16]
+                const y = Math.random() * 33 - 16;  // y 范围 [-16, 17]
+                const bounds = getHeartYBounds(x);
+                if (y >= bounds.minY && y <= bounds.maxY) {
+                    return { x, y };
+                }
+                attempts++;
+            }
+            return { x: 0, y: 0 };
+        }
+
+        // 高清晰度文字像素采样函数
+        function scanTextPoints(text, fontSize) {
+            const tempCanvas = document.createElement('canvas');
+            const tempCtx = tempCanvas.getContext('2d');
+            
+            tempCanvas.width = 440;
+            tempCanvas.height = 160;
+            
+            tempCtx.fillStyle = '#000';
+            tempCtx.fillRect(0, 0, tempCanvas.width, tempCanvas.height);
+            
+            tempCtx.fillStyle = '#fff';
+            tempCtx.font = 'bold ' + fontSize + 'px "Microsoft YaHei", "PingFang SC", "Helvetica Neue", sans-serif';
+            tempCtx.textAlign = 'center';
+            tempCtx.textBaseline = 'middle';
+            tempCtx.fillText(text, tempCanvas.width / 2, tempCanvas.height / 2);
+            
+            const imgData = tempCtx.getImageData(0, 0, tempCanvas.width, tempCanvas.height);
+            const points = [];
+            const step = 2; // 高精细密度采样
+            
+            for (let y = 0; y < tempCanvas.height; y += step) {
+                for (let x = 0; x < tempCanvas.width; x += step) {
+                    const index = (y * tempCanvas.width + x) * 4;
+                    if (imgData.data[index] > 100) {
+                        points.push({
+                            x: x - tempCanvas.width / 2,
+                            y: y - tempCanvas.height / 2
+                        });
+                    }
+                }
+            }
+            return points;
+        }
+
+        // 粒子类
+        class Particle {
+            constructor(type, index) {
+                this.type = type;
+                this.index = index;
+
+                // 基础坐标
+                this.x = width / 2;
+                this.y = height / 2;
+                this.size = Math.random() * 1.5 + 0.6; // 粒子规格
+
+                // 统一质感的唯美粉色调
+                const hue = 325 + Math.random() * 20;
+                const saturation = 95 + Math.random() * 5;
+                const lightness = 65 + Math.random() * 15;
+                this.alpha = Math.random() * 0.6 + 0.4;
+                this.color = `hsla(${hue}, ${saturation}%, ${lightness}%, `;
+
+                this.timeOffset = Math.random() * 100;
+                this.speed = Math.random() * 0.05 + 0.02;
+
+                if (this.type === TYPE_OUTLINE) {
+                    // 1. 轮廓粒子：分布在爱心边缘上
+                    this.t = Math.random() * Math.PI * 2;
+                    const basePoint = getHeartPoint(this.t);
+                    this.targetX = basePoint.x;
+                    this.targetY = basePoint.y;
+
+                    const angle = Math.random() * Math.PI * 2;
+                    const scatterDistance = Math.pow(Math.random(), 3) * 15;
+                    this.offsetX = Math.cos(angle) * scatterDistance;
+                    this.offsetY = Math.sin(angle) * scatterDistance;
+                    
+                } else if (this.type === TYPE_INNER) {
+                    // 2. 内部粒子：绝无中心线暗区，高度自然分布
+                    const innerPoint = getRandomPointInsideHeart();
+                    this.targetX = innerPoint.x;
+                    this.targetY = innerPoint.y;
+                    this.offsetX = 0;
+                    this.offsetY = 0;
+                    this.size = Math.random() * 1.1 + 0.4;
+                    this.alpha = Math.random() * 0.35 + 0.15;
+
+                } else if (this.type === TYPE_ORBIT_TEXT) {
+                    // 3. 环绕 & 文字粒子 (交错分配至上方"to 欣"和下方"love you")
+                    this.isBottomText = (index % 2 === 0);
+
+                    // 椭圆运动轨道参数
+                    this.orbitAngle = Math.random() * Math.PI * 2;
+                    this.orbitSpeed = (Math.random() * 0.015 + 0.008) * (Math.random() > 0.5 ? 1 : -1);
+                    this.orbitRadX = 22 + Math.random() * 6;
+                    this.orbitRadY = 18 + Math.random() * 5;
+
+                    // 映射对应的文字目标点
+                    const targetPoints = this.isBottomText ? textPointsBottom : textPointsTop;
+                    const tPoint = targetPoints[this.index % targetPoints.length];
+                    
+                    // 极小笔触抖动系数，确保边缘干净纯粹
+                    this.textTargetX = tPoint.x + (Math.random() - 0.5) * 0.6;
+                    this.textTargetY = tPoint.y + (Math.random() - 0.5) * 0.6;
+
+                    this.vx = 0;
+                    this.vy = 0;
+                    this.lastState = STATE_ORBIT;
+                }
+            }
+
+            update(scale, globalTime, state, stateProgress, heartScaleMultiplier) {
+                const floatX = Math.sin(globalTime + this.timeOffset) * 0.6;
+                const floatY = Math.cos(globalTime + this.timeOffset) * 0.6;
+
+                // 结合收缩系数后的爱心实际尺寸
+                const currentHeartScale = scale * heartScaleMultiplier;
+
+                if (this.type === TYPE_OUTLINE || this.type === TYPE_INNER) {
+                    // 轮廓和内部粒子跟随心跳 & 同步缩放
+                    const actualTargetX = width / 2 + (this.targetX * currentHeartScale) + (this.offsetX * (currentHeartScale / 15)) + floatX;
+                    const actualTargetY = height / 2 + (this.targetY * currentHeartScale) + (this.offsetY * (currentHeartScale / 15)) + floatY;
+                    this.x += (actualTargetX - this.x) * this.speed;
+                    this.y += (actualTargetY - this.y) * this.speed;
+
+                } else if (this.type === TYPE_ORBIT_TEXT) {
+                    // 计算环绕轨迹 (环绕轨道同样在文字聚合时缩小，增加凝聚感)
+                    this.orbitAngle += this.orbitSpeed;
+                    const orbitX = width / 2 + Math.cos(this.orbitAngle) * this.orbitRadX * currentHeartScale;
+                    const orbitYOffset = this.isBottomText ? (3 * currentHeartScale) : (-3 * currentHeartScale);
+                    const orbitY = height / 2 + Math.sin(this.orbitAngle) * this.orbitRadY * currentHeartScale + orbitYOffset;
+
+                    // 计算文字汇聚坐标 
+                    // 精细调整文字本身大小，保证绝对清晰美观
+                    const textScale = this.isBottomText ? (scale * 0.12) : (scale * 0.14);
+                    // 上下偏移量使用 currentHeartScale，使其随爱心一同向内聚拢，防止超出视口边界
+                    const textYOffset = this.isBottomText ? (19.5 * currentHeartScale) : (-18 * currentHeartScale);
+
+                    const textX = width / 2 + this.textTargetX * textScale;
+                    const textY = height / 2 + this.textTargetY * textScale + textYOffset;
+
+                    // 状态机流转
+                    if (state === STATE_ORBIT) {
+                        this.x += (orbitX - this.x) * 0.05;
+                        this.y += (orbitY - this.y) * 0.05;
+
+                    } else if (state === STATE_TRANSITION) {
+                        // 飞速凝聚过程（凝聚更敏捷）
+                        const t = Math.sin(stateProgress * Math.PI / 2);
+                        const targetX = orbitX + (textX - orbitX) * t;
+                        const targetY = orbitY + (textY - orbitY) * t;
+                        this.x += (targetX - this.x) * 0.15;
+                        this.y += (targetY - this.y) * 0.15;
+
+                    } else if (state === STATE_HOLD) {
+                        // 文字成型保持，轻微正弦波呼吸
+                        const wave = Math.sin(globalTime * 2.5 + this.index * 0.06) * 1.0;
+                        this.x += (textX - this.x) * 0.15;
+                        this.y += (textY + wave - this.y) * 0.15;
+
+                    } else if (state === STATE_DISPERSE) {
+                        // 散落消逝：对称星雨散开
+                        if (this.lastState !== STATE_DISPERSE) {
+                            const angle = Math.random() * Math.PI * 2;
+                            const force = Math.random() * 2.2 + 0.4;
+                            this.vx = Math.cos(angle) * force + (Math.random() - 0.2) * 0.8;
+                            
+                            if (this.isBottomText) {
+                                // 下方文字粒子向下坠落散开
+                                this.vy = Math.sin(angle) * force + Math.random() * 3.5 + 1.2;
+                            } else {
+                                // 上方文字粒子向上升华散开
+                                this.vy = Math.sin(angle) * force - Math.random() * 3.5 - 1.2;
+                            }
+                        }
+                        
+                        this.x += this.vx;
+                        this.y += this.vy;
+                        
+                        this.vx *= 0.96;
+                        this.vy *= 0.96;
+                        
+                        // 附加物理漂移力
+                        if (this.isBottomText) {
+                            this.vy += 0.04; // 下落重力
+                        } else {
+                            this.vy -= 0.04; // 上升浮力
+                        }
+                    }
+
+                    this.lastState = state;
+                }
+            }
+
+            draw(state) {
+                let currentAlpha = this.alpha;
+                let currentSize = this.size;
+
+                if (this.type === TYPE_ORBIT_TEXT) {
+                    if (state === STATE_HOLD) {
+                        // 定格阶段微微闪烁
+                        currentAlpha = this.alpha * (0.8 + Math.sin(Date.now() * 0.008 + this.index) * 0.2);
+                        currentSize = this.size * 1.2;
+                    } else if (state === STATE_DISPERSE) {
+                        // 渐隐
+                        currentAlpha = this.alpha * (1 - (frameCount % TOTAL_CYCLE - (DUR_ORBIT + DUR_TRANSITION + DUR_HOLD)) / DUR_DISPERSE);
+                        if (currentAlpha < 0) currentAlpha = 0;
+                    }
+                }
+
+                ctx.fillStyle = this.color + currentAlpha + ')';
+                ctx.fillRect(this.x - currentSize / 2, this.y - currentSize / 2, currentSize, currentSize);
+            }
+        }
+
+        // 初始化粒子池
+        function initParticles() {
+            particles = [];
+
+            // 1. 产生心形轮廓粒子 (约 7000 个)
+            const outlineCount = 7000;
+            for (let i = 0; i < outlineCount; i++) {
+                particles.push(new Particle(TYPE_OUTLINE, i));
+            }
+
+            // 2. 产生心形内部粒子 (约 3500 个)
+            const innerCount = 3500;
+            for (let i = 0; i < innerCount; i++) {
+                particles.push(new Particle(TYPE_INNER, i));
+            }
+
+            // 3. 产生高密度组字粒子 (根据最长的字自动扩充，保证上下文字都饱满)
+            const maxPointsLength = Math.max(textPointsTop.length, textPointsBottom.length);
+            const orbitCount = maxPointsLength * 3.2; // 3.2倍超频覆盖，呈现极其厚重炫目的字迹
+            for (let i = 0; i < orbitCount; i++) {
+                particles.push(new Particle(TYPE_ORBIT_TEXT, i));
+            }
+        }
+
+        let time = 0;
+        
+        // 渲染大循环
+        function animate() {
+            // 微妙余晖拖尾
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.16)';
+            ctx.fillRect(0, 0, width, height);
+
+            // 开启物理发光图层混合模式
+            ctx.globalCompositeOperation = 'screen';
+
+            // 1. 获取缩短周期后的当前状态
+            const cycleFrame = frameCount % TOTAL_CYCLE;
+            let currentState = STATE_ORBIT;
+            let stateProgress = 0;
+
+            if (cycleFrame < DUR_ORBIT) {
+                currentState = STATE_ORBIT;
+                stateProgress = cycleFrame / DUR_ORBIT;
+            } else if (cycleFrame < DUR_ORBIT + DUR_TRANSITION) {
+                currentState = STATE_TRANSITION;
+                stateProgress = (cycleFrame - DUR_ORBIT) / DUR_TRANSITION;
+            } else if (cycleFrame < DUR_ORBIT + DUR_TRANSITION + DUR_HOLD) {
+                currentState = STATE_HOLD;
+                stateProgress = (cycleFrame - DUR_ORBIT - DUR_TRANSITION) / DUR_HOLD;
+            } else {
+                currentState = STATE_DISPERSE;
+                stateProgress = (cycleFrame - DUR_ORBIT - DUR_TRANSITION - DUR_HOLD) / DUR_DISPERSE;
+            }
+
+            // 2. 动态计算爱心收缩系数 (进入显示文字状态时，平滑地由 1.0 缩减至 0.72)
+            let heartScaleMultiplier = 1.0;
+            if (currentState === STATE_ORBIT) {
+                heartScaleMultiplier = 1.0;
+            } else if (currentState === STATE_TRANSITION) {
+                // 使用 ease-out 缓动曲线平滑过渡
+                const t = Math.sin(stateProgress * Math.PI / 2);
+                heartScaleMultiplier = 1.0 - 0.28 * t; 
+            } else if (currentState === STATE_HOLD) {
+                heartScaleMultiplier = 0.72; // 锁定在 72% 黄金收缩比例
+            } else if (currentState === STATE_DISPERSE) {
+                // 散落阶段平滑复原到 1.0
+                heartScaleMultiplier = 0.72 + 0.28 * stateProgress;
+            }
+
+            // 3. 动感心跳心形缩放 (基础缩放大小根据窗口自适应)
+            const baseScale = Math.min(width, height) / 44; 
+            const beat = Math.sin(time) * Math.pow(Math.sin(time * 1.5), 3);
+            const scale = baseScale + beat * (baseScale * 0.12);
+
+            // 4. 更新并渲染粒子
+            for (let i = 0; i < particles.length; i++) {
+                particles[i].update(scale, time, currentState, stateProgress, heartScaleMultiplier);
+                particles[i].draw(currentState);
+            }
+
+            ctx.globalCompositeOperation = 'source-over';
+
+            time += 0.055; 
+            frameCount++;
+            requestAnimationFrame(animate);
+        }
+
+        window.addEventListener('resize', () => {
+            initCanvas();
+        });
+
+        // 启动
+        initCanvas();
+        textPointsTop = scanTextPoints('to 欣', 80);      // 扫描上方文字
+        textPointsBottom = scanTextPoints('love you', 76); // 扫描下方文字
+        initParticles();
+        animate();
+    </script>
+</body>
+</html>
